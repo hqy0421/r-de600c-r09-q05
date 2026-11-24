@@ -36,9 +36,19 @@ from energydb._ch_meta_engine import CH_ENGINE_TABLE
 from energydb._frames import Backend, Output, to_backend, to_polars
 from energydb._io import WriteResult, annotate_undefined_table, execute_read
 from energydb._join import EdgeSeriesKey, SeriesKey
-from energydb._persist import _fetch_edges_by_uuids, _fetch_nodes_by_uuids, map_edge_conflict, register_tree_under
+from energydb._persist import (
+    _fetch_edges_by_uuids,
+    _fetch_nodes_by_uuids,
+    map_edge_conflict,
+    register_tree_under,
+)
 from energydb.diff import EdgeChange, NodeChange, TreeDiff
-from energydb.errors import EdgeNotFoundError, NodeNotFoundError, NotFoundError, ValidationError
+from energydb.errors import (
+    EdgeNotFoundError,
+    NodeNotFoundError,
+    NotFoundError,
+    ValidationError,
+)
 from energydb.models import SQL_SCHEMA_PREFIX as P
 from energydb.paths import (
     Path,
@@ -50,6 +60,15 @@ from energydb.paths import (
     resolve_edge_uuid,
     resolve_node_uuid,
     resolve_subtree_uuids,
+)
+from energydb.replay import (
+    ReplayWindow,
+    empty_replay_frame,
+    empty_version_frame,
+    partition_by_batch,
+    replay_series,
+    require_single_series,
+    versions_for_series,
 )
 from energydb.serialization import reconstruct_edge, reconstruct_node
 
@@ -218,6 +237,29 @@ def _strip_scope_identity(result: pl.DataFrame, *, is_edge: bool) -> pl.DataFram
     cols = _SCOPE_IDENTITY_EDGE if is_edge else _SCOPE_IDENTITY_NODE
     present = [c for c in cols if c in result.columns]
     return result.drop(present) if present else result
+
+
+def _rescale_replay_values(
+    frame: pl.DataFrame,
+    meta: pl.DataFrame,
+    series_id: int,
+    requested_unit: str,
+) -> pl.DataFrame:
+    """Scale a single-series replay frame's ``value`` to ``requested_unit``.
+
+    Replay resolves to exactly one series, so its canonical unit is a scalar
+    lookup on the resolved meta; the factor semantics match
+    :func:`energydb._io.apply_per_series_unit` (``None`` factor → unchanged).
+    """
+    from energydb.units import compute_unit_factor
+
+    units = meta.filter(pl.col("series_id") == series_id)["canonical_unit"].unique().to_list()
+    if not units:
+        return frame
+    factor = compute_unit_factor(units[0], requested_unit)
+    if factor is None:
+        return frame
+    return frame.with_columns((pl.col("value") * factor).alias("value"))
 
 
 def _attach_routing(
@@ -703,6 +745,127 @@ class _BaseScope:
             td_kwargs=td_read_kwargs,
         )
         return self._finalize_result(result, n_series=n_series, output=output, backend=backend)
+
+    async def replay(
+        self,
+        *,
+        data_type: str,
+        name: str,
+        unit: str | None = None,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        as_batches: bool = False,
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame | list[tuple[datetime, pl.DataFrame | pd.DataFrame]]:
+        """Replay one series' forecast revisions in arrival order.
+
+        The bitemporal counterpart of :meth:`read` for revision analysis.
+        Where :meth:`read` orders by ``valid_time`` (the subject axis),
+        replay orders by ``knowledge_time`` first: rows come out batch by
+        batch as the revisions actually arrived, and within each batch by
+        ``valid_time``. The two axes stay independent — the
+        ``start_valid`` / ``end_valid`` window only filters which valid-time
+        points each batch covers; it never reorders the arrivals. The same
+        ``valid_time`` therefore appears once per batch that covered it, each
+        row carrying that batch's ``knowledge_time`` / ``run_id``.
+
+        Single series only: the scope plus ``data_type`` / ``name`` must
+        resolve to exactly one series, otherwise
+        :class:`~energydb.errors.ValidationError` is raised (interleaving two
+        series' arrival streams would be meaningless).
+
+        Frame output columns, in order:
+        ``(knowledge_time, valid_time, value, run_id)``. One row per
+        ``(knowledge_time, valid_time)`` — the latest correction
+        (``change_time``) within the batch wins, matching the overlapping
+        read. ``run_id`` joins to :meth:`Client.read_runs_for_series` / the
+        ``runs`` catalog for workflow, model, and run parameters.
+
+        The four window bounds are half-open (``>= start``, ``< end``) and
+        apply to different axes: ``start_known`` / ``end_known`` constrain
+        ``knowledge_time`` (which batches), ``start_valid`` / ``end_valid``
+        constrain ``valid_time`` (which points inside each batch).
+
+        With ``as_batches=True`` the frame is split into
+        ``[(knowledge_time, batch_frame), ...]`` in arrival order; each
+        ``batch_frame`` is ``(valid_time, value, run_id)`` sorted by
+        ``valid_time`` — iterate it to step through revisions one batch at a
+        time. A series with no matching rows returns an empty frame (or an
+        empty list).
+
+        ``unit`` rescales ``value`` from the series' canonical unit, the same
+        per-series factor :meth:`read` applies; ``backend="pandas"`` converts
+        at the boundary (batch sub-frames included).
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("replay")
+        window = ReplayWindow(
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+        )
+        meta = await self._build_resolved_meta(data_type=data_type, name=name)
+        series_id = require_single_series(meta)
+
+        result = await replay_series(self._td, series_id, window)
+        if result.is_empty():
+            return [] if as_batches else to_backend(empty_replay_frame(), backend)
+
+        result = result.drop("series_id")
+        if unit is not None:
+            result = _rescale_replay_values(result, meta, series_id, unit)
+
+        if as_batches:
+            batches = partition_by_batch(result)
+            if backend == "pandas":
+                return [(kt, sub.to_pandas()) for kt, sub in batches]
+            return batches
+        return to_backend(result, backend)
+
+    async def replay_versions(
+        self,
+        *,
+        data_type: str,
+        name: str,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        start_known: datetime | None = None,
+        end_known: datetime | None = None,
+        backend: Backend = "polars",
+    ) -> pl.DataFrame | pd.DataFrame:
+        """List one series' revision batches (distinct knowledge_times).
+
+        The arrival-axis index for :meth:`replay`, without pulling values:
+        one row per distinct ``knowledge_time`` that touched the series,
+        oldest first, with the ``run_id`` of the write that last touched the
+        batch and ``n_valid_times`` — how many valid-time points that batch
+        covers within the windows. Hydrate a ``run_id`` via
+        :meth:`Client.read_runs_for_series` for workflow/model metadata.
+
+        Columns, in order:
+        ``(knowledge_time, run_id, n_valid_times)``. The window bounds have
+        the same two-axis meaning as in :meth:`replay` and are half-open.
+        Single series only; a scope resolving to zero or several series
+        raises :class:`~energydb.errors.ValidationError`.
+        """
+        if self._txn is not None:
+            _ts_io_unsupported_in_txn("replay_versions")
+        window = ReplayWindow(
+            start_valid=start_valid,
+            end_valid=end_valid,
+            start_known=start_known,
+            end_known=end_known,
+        )
+        meta = await self._build_resolved_meta(data_type=data_type, name=name)
+        series_id = require_single_series(meta)
+
+        result = await versions_for_series(self._td, series_id, window)
+        if result.is_empty():
+            return to_backend(empty_version_frame(), backend)
+        return to_backend(result, backend)
 
 
 class NodeScope(_BaseScope):

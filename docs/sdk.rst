@@ -40,7 +40,9 @@ series:
 
 The same ``client.write`` / ``client.read`` pipeline handles both. OVERLAPPING
 series additionally require a ``knowledge_time`` (kwarg or column) on every
-write.
+write. To inspect how successive forecast revisions arrived — rather than
+the latest values per valid time — see
+:ref:`Bitemporal replay <sdk-bitemporal-replay>`.
 
 
 Getting Started
@@ -762,6 +764,101 @@ Per-window cutoffs (for backtesting / day-ahead simulation) are exposed via
 :meth:`NodeScope.read_relative <energydb.NodeScope.read_relative>` — same
 window-length / issue-offset / daily-shorthand semantics as
 :meth:`timedb.TimeDBClient.read_relative`.
+
+
+.. _sdk-bitemporal-replay:
+
+Bitemporal replay — forecast revision streams
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A forecast series is revised repeatedly: every run issues a batch of points
+under a new ``knowledge_time``, often revising valid times an earlier batch
+already covered. :meth:`read` answers "what is the value for valid time
+*t*?" and orders rows by the subject axis (``valid_time``). Revision
+analysis asks a different question — "in what order did the revisions
+**arrive**, and what did each arrival say?" — and needs the arrival axis
+first. :meth:`NodeScope.replay <energydb.NodeScope.replay>` provides that
+view on a single OVERLAPPING series.
+
+The two time dimensions are independent and are never merged onto one axis:
+
+- ``knowledge_time`` is the *arrival* axis: distinct knowledge_times are the
+  forecast batches as they were issued, and the result is ordered by it.
+- ``valid_time`` is the *subject* axis: the real-world moments the forecasts
+  describe. A valid-time window (``start_valid`` / ``end_valid``) only
+  filters which points each batch contains; it never reorders the batches.
+
+The same ``valid_time`` therefore appears once per batch that covered it —
+each revision preserved as its own row instead of being collapsed to the
+latest value. Flattening both axes onto one timeline would destroy either
+the arrival order or the valid-time identity of the points.
+
+.. code-block:: python
+
+   scope = client.get_node("my-portfolio", "Offshore-1", "T01")
+
+   # The full version stream: knowledge_time first, valid_time second.
+   df = scope.replay(data_type="forecast", name="power")
+   # columns: (knowledge_time, valid_time, value, run_id)
+
+   # Subject-axis window — which points each batch may contain. The arrivals
+   # still come out in knowledge_time order.
+   scope.replay(
+       data_type="forecast", name="power",
+       start_valid=datetime(2026, 1, 2, tzinfo=UTC),
+       end_valid=datetime(2026, 1, 3, tzinfo=UTC),
+   )
+
+   # Arrival-axis window — which batches, whatever valid times they held.
+   scope.replay(
+       data_type="forecast", name="power",
+       start_known=datetime(2026, 1, 1, 6, tzinfo=UTC),
+       end_known=datetime(2026, 1, 2, tzinfo=UTC),
+   )
+
+All four bounds are half-open (``>= start``, ``< end``) and may be combined
+freely — each pair filters its own axis. One row is returned per
+``(knowledge_time, valid_time)``; when a batch corrects the same point
+several times, the latest correction (largest ``change_time``) wins, exactly
+as in the overlapping read. Stored NaN nulls surface as null values.
+
+``as_batches=True`` splits the stream into one sub-frame per arrival, so
+iterating it replays the revisions batch by batch:
+
+.. code-block:: python
+
+   for knowledge_time, batch in scope.replay(
+       data_type="forecast", name="power", as_batches=True,
+   ):
+       ...  # batch: (valid_time, value, run_id), sorted by valid_time
+
+A series with no matching rows yields an empty frame with the typed schema,
+or an empty list under ``as_batches=True``. ``unit`` rescales values with
+the same per-series factor as :meth:`read`, and ``backend="pandas"``
+converts the frame (and every batch sub-frame) at the boundary.
+
+``replay_versions`` is the arrival-axis index without the values:
+
+.. code-block:: python
+
+   versions = scope.replay_versions(data_type="forecast", name="power")
+   # columns: (knowledge_time, run_id, n_valid_times)
+
+One row per distinct ``knowledge_time``, oldest first; ``n_valid_times`` is
+the number of distinct valid-time points that batch covers inside the
+window. The ``run_id`` on either result joins to the run catalog —
+:meth:`Client.read_runs_for_series
+<energydb.AsyncClient.read_runs_for_series>` — for the workflow id, model
+name, and run parameters that produced each revision.
+
+.. note::
+
+   **Single series only.** A replay interleaves one series' own arrivals, so
+   the scope plus ``data_type`` / ``name`` must resolve to exactly one
+   series. A scope resolving to none or to several raises
+   :class:`~energydb.errors.ValidationError`; narrow it with
+   ``data_type=`` / ``name=`` or navigate to one node/edge. Edge scopes
+   expose the identical methods.
 
 
 Bulk Manifest I/O
